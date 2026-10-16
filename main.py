@@ -1,4 +1,5 @@
 import configparser
+from datetime import datetime, timezone, timedelta
 import itertools
 import json
 import logging
@@ -21,6 +22,9 @@ load_dotenv('oci.env')
 
 ARM_SHAPE = "VM.Standard.A1.Flex"
 E2_MICRO_SHAPE = "VM.Standard.E2.1.Micro"
+WIB = timezone(timedelta(hours=7))
+HEARTBEAT_HOURS = [0, 6, 12, 18]
+NEXT_REPORT_MAP = {0: "06:00", 6: "12:00", 12: "18:00", 18: "00:00"}
 
 # Access loaded environment variables and strip white spaces
 OCI_CONFIG = os.getenv("OCI_CONFIG", "").strip()
@@ -246,14 +250,14 @@ def create_instance_details_file_and_notify(instance, shape=ARM_SHAPE):
 
     # Discord Notification for Instance Created
     discord_msg = (
-        f"🎉 **[OCI Instance Berhasil Dibuat!]**\n"
-        f"• **Nama Instance:** `{instance.display_name}`\n"
+        f"🎉 **OCI Bot** · `PROVISIONED`\n"
+        f"• **Instance:** `{instance.display_name}`\n"
         f"• **Shape:** `{instance.shape}`\n"
-        f"• **Availability Domain:** `{instance.availability_domain}`\n"
-        f"• **Status:** `{instance.lifecycle_state}`\n"
+        f"• **State:** `{instance.lifecycle_state}`\n"
         f"• **Public IP:** `{ip_display}`\n"
+        f"• **Domain:** `{instance.availability_domain}`\n"
         f"• **Instance ID:** `{instance.id}`\n\n"
-        f"🔑 SSH private key tersimpan di folder project (`id_rsa_private`)."
+        f"🔑 *SSH private key: `id_rsa_private`*"
     )
     send_discord_message(discord_msg)
 
@@ -281,7 +285,7 @@ def notify_on_failure(failure_msg):
         f"{failure_msg}"
     )
     write_into_file('UNHANDLED_ERROR.log', mail_body)
-    send_discord_message(f"🚨 **[OCI Bot Berhenti Karena Error]**\n```{failure_msg[:1800]}```")
+    send_discord_message(f"🚨 **OCI Bot** · `ERROR`\n```{failure_msg[:1800]}```")
     if NOTIFY_EMAIL:
         send_email('OCI INSTANCE CREATION SCRIPT: FAILED DUE TO AN ERROR', mail_body, EMAIL, EMAIL_PASSWORD)
 
@@ -512,7 +516,7 @@ def launch_instance():
     instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE, tries=1)
 
     if instance_exist_flag:
-        msg = f"ℹ️ **[OCI Bot]** Instance `{OCI_COMPUTE_SHAPE}` sudah ditemukan dan aktif di tenancy Anda."
+        msg = "ℹ️ **OCI Bot** · `COMPLETED`\nTarget instance is already active or quota limit reached. Task finalized."
         print(f"[*] {msg.replace('**', '').replace('`', '')}")
         send_discord_message(msg)
         return
@@ -528,6 +532,8 @@ def launch_instance():
     print(f"[*] Memulai proses request... Interval tunggu: {WAIT_TIME} detik jika kapasitas penuh.\n")
 
     attempt = 0
+    start_time = time.time()
+    last_heartbeat_slot = None
     while not instance_exist_flag:
         attempt += 1
         current_time = time.strftime("%H:%M:%S")
@@ -577,7 +583,7 @@ def launch_instance():
                 if instance_exist_flag:
                     logging_step5.info("%s , exiting the program", srv_err.code)
                     print("\n[!] LimitExceeded: Instance sudah dibuat sebelumnya. Selesai.")
-                    send_discord_message("ℹ️ **[OCI Bot]** Kuota tercapai (LimitExceeded) dan instance sudah aktif. Skrip selesai.")
+                    send_discord_message("ℹ️ **OCI Bot** · `COMPLETED`\nTarget instance is already active or quota limit reached. Task finalized.")
                     sys.exit()
                 logging_step5.info("Didn't find an instance , proceeding with retries")
             data = {
@@ -594,26 +600,47 @@ def launch_instance():
             }
             handle_errors("launch_instance", data, logging_step5)
 
+        # Scheduled Heartbeat: 00:00, 06:00, 12:00, 18:00 WIB
+        now_wib = datetime.now(WIB)
+        current_slot = f"{now_wib.strftime('%Y-%m-%d')}_{now_wib.hour}"
+        if not instance_exist_flag and now_wib.hour in HEARTBEAT_HOURS and current_slot != last_heartbeat_slot:
+            last_heartbeat_slot = current_slot
+            elapsed_sec = int(time.time() - start_time)
+            hours, rem = divmod(elapsed_sec, 3600)
+            mins, _ = divmod(rem, 60)
+            uptime_str = f"{hours}h {mins}m" if hours > 0 else f"{mins}m"
+            next_report = NEXT_REPORT_MAP.get(now_wib.hour, "06:00")
+            heartbeat_msg = (
+                f"💓 **OCI Bot** · `HEARTBEAT`\n"
+                f"• **Status:** `Active`\n"
+                f"• **Attempts:** `#{attempt}`\n"
+                f"• **Uptime:** `{uptime_str}`\n"
+                f"• **Target:** `{OCI_COMPUTE_SHAPE}`\n"
+                f"• **Next Report:** `{next_report} WIB`"
+            )
+            send_discord_message(heartbeat_msg)
+
 
 if __name__ == "__main__":
     region_val = config.get("region", "ap-batam-1") if hasattr(config, "get") else "ap-batam-1"
+    shape_details = f"{OCI_COMPUTE_SHAPE} (2 OCPU / 12 GB RAM)" if OCI_COMPUTE_SHAPE == ARM_SHAPE else OCI_COMPUTE_SHAPE
     startup_msg = (
-        f"🚀 **[OCI Bot Berjalan]** Skrip pembuat instance telah mulai aktif!\n"
-        f"• **Nama Instance:** `{DISPLAY_NAME}`\n"
-        f"• **Shape:** `{OCI_COMPUTE_SHAPE}`\n"
+        f"🚀 **OCI Bot** · `ONLINE`\n"
+        f"• **Shape:** `{shape_details}`\n"
         f"• **Region:** `{region_val}`\n"
-        f"• **Interval Coba Ulang:** `{WAIT_TIME}` detik\n"
-        f"Skrip akan mencoba terus secara otomatis sampai kapasitas server tersedia."
+        f"• **Retry Interval:** `{WAIT_TIME}s`\n"
+        f"• **Heartbeat:** `00:00, 06:00, 12:00, 18:00 WIB`\n"
+        f"*Polling OCI compute capacity...*"
     )
     send_discord_message(startup_msg)
     try:
         launch_instance()
     except KeyboardInterrupt:
-        stop_msg = "🛑 **[OCI Bot Berhenti]** Skrip telah dihentikan manual oleh pengguna (Ctrl+C)."
+        stop_msg = "🛑 **OCI Bot** · `STOPPED`\nProcess terminated by operator."
         print(f"\n\n[!] {stop_msg.replace('**', '')}")
         send_discord_message(stop_msg)
         sys.exit(0)
     except Exception as e:
-        error_message = f"🚨 **[OCI Bot Berhenti]** Terjadi error tak terduga:\n```{str(e)[:1800]}```"
+        error_message = f"🚨 **OCI Bot** · `ERROR`\n```{str(e)[:1800]}```"
         send_discord_message(error_message)
         raise
