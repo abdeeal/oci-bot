@@ -623,13 +623,11 @@ def launch_instance():
 
 if __name__ == "__main__":
     region_val = config.get("region", "ap-batam-1") if hasattr(config, "get") else "ap-batam-1"
-    shape_details = f"{OCI_COMPUTE_SHAPE} (2 OCPU / 12 GB RAM)" if OCI_COMPUTE_SHAPE == ARM_SHAPE else OCI_COMPUTE_SHAPE
     startup_msg = (
         f"🚀 **OCI Bot** · `ONLINE`\n"
-        f"• **Shape:** `{shape_details}`\n"
+        f"• **Shape:** `{OCI_COMPUTE_SHAPE}`\n"
         f"• **Region:** `{region_val}`\n"
         f"• **Retry Interval:** `{WAIT_TIME}s`\n"
-        f"• **Heartbeat:** `00:00, 06:00, 12:00, 18:00 WIB`\n"
         f"*Polling OCI compute capacity...*"
     )
     send_discord_message(startup_msg)
