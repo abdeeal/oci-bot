@@ -202,6 +202,25 @@ def generate_html_body(instance):
     return html_body
 
 
+def get_instance_public_ip(compartment_id, instance_id):
+    """Retrieve public IP of an instance if attached."""
+    try:
+        attachments = execute_oci_command(
+            compute_client,
+            "list_vnic_attachments",
+            compartment_id=compartment_id,
+            instance_id=instance_id,
+        )
+        for attachment in attachments:
+            if attachment.lifecycle_state in ["ATTACHED", "ATTACHING"]:
+                vnic = execute_oci_command(network_client, "get_vnic", attachment.vnic_id)
+                if hasattr(vnic, "public_ip") and vnic.public_ip:
+                    return vnic.public_ip
+    except Exception as e:
+        logging.warning("Gagal mengambil Public IP: %s", e)
+    return None
+
+
 def create_instance_details_file_and_notify(instance, shape=ARM_SHAPE):
     """Create a file with details of instances and notify the user.
 
@@ -210,16 +229,33 @@ def create_instance_details_file_and_notify(instance, shape=ARM_SHAPE):
         shape (str): shape of the instance to be created, acceptable values are
          "VM.Standard.A1.Flex", "VM.Standard.E2.1.Micro"
     """
+    public_ip = get_instance_public_ip(instance.compartment_id, instance.id) if hasattr(instance, "compartment_id") else None
+    ip_display = public_ip if public_ip else "Belum teralokasi (silakan cek OCI Console)"
+
     details = [f"Instance ID: {instance.id}",
                f"Display Name: {instance.display_name}",
                f"Availability Domain: {instance.availability_domain}",
                f"Shape: {instance.shape}",
                f"State: {instance.lifecycle_state}",
+               f"Public IP: {ip_display}",
                "\n"]
     micro_body = 'TWo Micro Instances are already existing and running'
     arm_body = '\n'.join(details)
     body = arm_body if shape == ARM_SHAPE else micro_body
     write_into_file('INSTANCE_CREATED', body)
+
+    # Discord Notification for Instance Created
+    discord_msg = (
+        f"🎉 **[OCI Instance Berhasil Dibuat!]**\n"
+        f"• **Nama Instance:** `{instance.display_name}`\n"
+        f"• **Shape:** `{instance.shape}`\n"
+        f"• **Availability Domain:** `{instance.availability_domain}`\n"
+        f"• **Status:** `{instance.lifecycle_state}`\n"
+        f"• **Public IP:** `{ip_display}`\n"
+        f"• **Instance ID:** `{instance.id}`\n\n"
+        f"🔑 SSH private key tersimpan di folder project (`id_rsa_private`)."
+    )
+    send_discord_message(discord_msg)
 
     # Generate HTML body for email
     html_body = generate_html_body(instance)
@@ -245,6 +281,7 @@ def notify_on_failure(failure_msg):
         f"{failure_msg}"
     )
     write_into_file('UNHANDLED_ERROR.log', mail_body)
+    send_discord_message(f"🚨 **[OCI Bot Berhenti Karena Error]**\n```{failure_msg[:1800]}```")
     if NOTIFY_EMAIL:
         send_email('OCI INSTANCE CREATION SCRIPT: FAILED DUE TO AN ERROR', mail_body, EMAIL, EMAIL_PASSWORD)
 
@@ -324,6 +361,9 @@ def handle_errors(command, data, log):
         or any(retry_msg in message for retry_msg in retryable_messages)
     ):
         log.info("Command: %s--\nOutput: %s", command, data)
+        current_time = time.strftime("%H:%M:%S")
+        error_info = message if message else data.get("code", "InternalError")
+        print(f"\n[{current_time}] Info: {error_info} -> Menunggu {WAIT_TIME} detik sebelum mencoba lagi...")
         time.sleep(WAIT_TIME)
         return True
 
@@ -471,16 +511,32 @@ def launch_instance():
     # Step 5 - Launch Instance if it's not already exist and running
     instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE, tries=1)
 
+    if instance_exist_flag:
+        msg = f"ℹ️ **[OCI Bot]** Instance `{OCI_COMPUTE_SHAPE}` sudah ditemukan dan aktif di tenancy Anda."
+        print(f"[*] {msg.replace('**', '').replace('`', '')}")
+        send_discord_message(msg)
+        return
+
     if OCI_COMPUTE_SHAPE == "VM.Standard.A1.Flex":
         shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=2, memory_in_gbs=12)
     else:
         shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=1, memory_in_gbs=1)
 
+    print(f"[*] Menyiapkan instance: {DISPLAY_NAME} ({OCI_COMPUTE_SHAPE})")
+    print(f"[*] Subnet: {oci_subnet_id}")
+    print(f"[*] Image: {oci_image_id}")
+    print(f"[*] Memulai proses request... Interval tunggu: {WAIT_TIME} detik jika kapasitas penuh.\n")
+
+    attempt = 0
     while not instance_exist_flag:
+        attempt += 1
+        current_time = time.strftime("%H:%M:%S")
+        target_ad = next(oci_ad_names)
+        print(f"[{current_time}] Percobaan #{attempt} (AD: {target_ad}): Mengirim request ke Oracle Cloud...", end=" ", flush=True)
         try:
             launch_instance_response = compute_client.launch_instance(
                 launch_instance_details=oci.core.models.LaunchInstanceDetails(
-                    availability_domain=next(oci_ad_names),
+                    availability_domain=target_ad,
                     compartment_id=oci_tenancy,
                     create_vnic_details=oci.core.models.CreateVnicDetails(
                         assign_public_ip=assign_public_ip,
@@ -507,20 +563,23 @@ def launch_instance():
                 )
             )
             if launch_instance_response.status == 200:
+                print("BERHASIL! (HTTP 200)")
                 logging_step5.info(
                     "Command: launch_instance\nOutput: %s", launch_instance_response
                 )
                 instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE)
 
         except oci.exceptions.ServiceError as srv_err:
-            if srv_err.code == "LimitExceeded":                
+            if srv_err.code == "LimitExceeded":
                 logging_step5.info("Encoundered LimitExceeded Error checking if instance is created" \
-                                   "code :%s, message: %s, status: %s", srv_err.code, srv_err.message, srv_err.status)                
+                                   "code :%s, message: %s, status: %s", srv_err.code, srv_err.message, srv_err.status)
                 instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE)
                 if instance_exist_flag:
                     logging_step5.info("%s , exiting the program", srv_err.code)
+                    print("\n[!] LimitExceeded: Instance sudah dibuat sebelumnya. Selesai.")
+                    send_discord_message("ℹ️ **[OCI Bot]** Kuota tercapai (LimitExceeded) dan instance sudah aktif. Skrip selesai.")
                     sys.exit()
-                logging_step5.info("Didn't find an instance , proceeding with retries")     
+                logging_step5.info("Didn't find an instance , proceeding with retries")
             data = {
                 "status": srv_err.status,
                 "code": srv_err.code,
@@ -537,11 +596,24 @@ def launch_instance():
 
 
 if __name__ == "__main__":
-    send_discord_message("🚀 OCI Instance Creation Script: Starting up! Let's create some cloud magic!")
+    region_val = config.get("region", "ap-batam-1") if hasattr(config, "get") else "ap-batam-1"
+    startup_msg = (
+        f"🚀 **[OCI Bot Berjalan]** Skrip pembuat instance telah mulai aktif!\n"
+        f"• **Nama Instance:** `{DISPLAY_NAME}`\n"
+        f"• **Shape:** `{OCI_COMPUTE_SHAPE}`\n"
+        f"• **Region:** `{region_val}`\n"
+        f"• **Interval Coba Ulang:** `{WAIT_TIME}` detik\n"
+        f"Skrip akan mencoba terus secara otomatis sampai kapasitas server tersedia."
+    )
+    send_discord_message(startup_msg)
     try:
         launch_instance()
-        send_discord_message("🎉 Success! OCI Instance has been created. Time to celebrate!")
+    except KeyboardInterrupt:
+        stop_msg = "🛑 **[OCI Bot Berhenti]** Skrip telah dihentikan manual oleh pengguna (Ctrl+C)."
+        print(f"\n\n[!] {stop_msg.replace('**', '')}")
+        send_discord_message(stop_msg)
+        sys.exit(0)
     except Exception as e:
-        error_message = f"😱 Oops! Something went wrong with the OCI Instance Creation Script:\n{str(e)}"
+        error_message = f"🚨 **[OCI Bot Berhenti]** Terjadi error tak terduga:\n```{str(e)[:1800]}```"
         send_discord_message(error_message)
         raise
